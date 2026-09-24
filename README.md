@@ -17,8 +17,10 @@ Service](https://learning.oreilly.com/terms/).
 # Usage
 
 ```
-$ pip install aiohttp lxml
-$ python3 oreilly_downloader.py 9781491958698 --jwt 'XYZ'
+$ pip install aiohttp lxml yarl
+$ touch cookies.json
+$ nano cookies.json # get cookie editor from firefox extension store, install it, copy the cookies, paste it in nano and save it as cookies.json
+$ python3 oreilly_downloader.py 9781633437777 --cookies cookies.json
 …
 created 9781491958698.epub
 ```
