@@ -1,5 +1,6 @@
 **AI development disclosure:** This project was developed with assistance from the free versions of ChatGPT, Grok, and Claude (LLMs), with the user providing ideas and testing while the AIs and user collaboratively suggested, generated, reviewed, and refined code and solutions.
 
+
 # O'Reilly EPUB downloader
 
 O'Reilly provides all of their books in EPUB format, but only through their own web reader.
