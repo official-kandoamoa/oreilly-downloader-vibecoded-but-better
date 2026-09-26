@@ -177,9 +177,9 @@ and the resulting cookies are saved back to `--cookies` right away, so a future 
 
 ## Contributing
 
-I am not really interested in adding any major features to this project. I will accept fixes, but nothing that adds a significant amount of new code.
+I am really interested in adding any major features to this project if necessary. I will genuine accept fixes, even that adds a significant amount of new code.
 
-If you feel like something is missing, feel free to fork. You may also look at rejected pull requests, maybe someone already worked on something similar.
+If you feel like something is missing, feel free to contribute or fork. You may also look at rejected pull requests, maybe someone already worked on something similar.
 
 ## Similar projects
 
