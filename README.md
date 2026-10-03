@@ -17,7 +17,7 @@ This project is provided **"as is" and "as available"**, without warranty of any
 If this software is deployed in ambiguous, high-risk, or production environments, the user bears **100% of the responsibility** to ensure compliance with local laws, corporate policies, and third-party terms of service. 
 
 
-> [!CAUTION]
+> [!WARNING]
 > **AI development disclosure:** This project was developed with assistance from the free versions of ChatGPT, Grok, and Claude (LLMs), with the user providing ideas and testing while the AIs and user collaboratively suggested, generated, reviewed, and refined code and solutions.
 
 ---
