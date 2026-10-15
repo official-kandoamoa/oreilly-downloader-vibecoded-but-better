@@ -2257,6 +2257,33 @@ def apply_cookies_to_session(session, records):
     session.cookie_jar.update_cookies(simple, response_url=yarl.URL(BASE_URL))
 
 
+
+def _save_cookie_records_atomic(path, records):
+    """Write a name→record dict to path atomically with private mode.
+
+    Used by the webview path (no live aiohttp jar yet) so cookie exports
+    never truncate the only copy of a refresh token mid-write.
+    """
+    payload = list(records.values()) if isinstance(records, dict) else list(records)
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path) or '.'
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.cookies.', suffix='.tmp', dir=parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+            f.write('\n')
+        _chmod_private(tmp)
+        os.replace(tmp, abs_path)
+        _chmod_private(abs_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save_cookies(path, records, session):
     """Write the current cookies for learning.oreilly.com back to path, as
     a full list of records (browser-export-compatible), not just a flat
@@ -2876,6 +2903,8 @@ def print_quick_reference():
         f"  python3 {prog} 9780000000001 --cookies cookies.json --calibre",
         f"  python3 {prog} --books books.txt --cookies cookies.json",
         f"  python3 {prog} 9780000000001 --cookies cookies.json --raw --calibre",
+        f"  python3 {prog} 9780000000001 --cookies cookies.json --title",
+        f"  python3 {prog} 9780000000001 --cookies cookies.json --require-auth",
         f"  python3 {prog} --cookies cookies.json --webview",
         "",
         "Common options",
@@ -3101,6 +3130,15 @@ async def amain():
         "After each successful EPUB, also convert to PDF with Calibre "
         "ebook-convert (keeps the EPUB). Off by default — pass --pdf to enable."
     ))
+    parser.add_argument('--title', action='store_true', help=(
+        "Name the output EPUB after the book title from the Learning API "
+        "(sanitised) instead of the numeric book id. Titles from --books "
+        "still take precedence when provided."
+    ))
+    parser.add_argument('--require-auth', action='store_true', help=(
+        "Exit immediately if there are no usable cookies/JWT or the auth "
+        "probe fails. Skips confirmation prompts; useful for scripts/CI."
+    ))
     parser.add_argument('--log', metavar='PATH', default=None, help=(
         "Write a detailed debug log to PATH (created if missing). Useful for "
         "diagnosing auth, path rewriting, and download failures. Console "
@@ -3226,6 +3264,11 @@ async def amain():
             'book content, and any EPUB produced may be empty or partial.',
             file=sys.stderr,
         )
+        if getattr(args, 'require_auth', False) and not args.webview:
+            _die(
+                'error: --require-auth set but no usable cookies or orm-jwt.\n'
+                '  Export cookies from a logged-in browser or pass --jwt / --webview.'
+            )
         if not args.webview:
             if not ask_continue(
                 'Are you sure you want to continue without valid cookies '
@@ -3248,6 +3291,11 @@ async def amain():
             'be partial.',
             file=sys.stderr,
         )
+        if getattr(args, 'require_auth', False):
+            _die(
+                'error: --require-auth set but orm-jwt is missing from cookies.\n'
+                '  Re-export cookies from a logged-in tab so orm-jwt is included.'
+            )
         if not ask_continue(
             'Continue without orm-jwt?',
             assume_yes=args.yes,
@@ -3275,8 +3323,10 @@ async def amain():
             for name, value in fresh.items():
                 records[name] = _make_record(name, value)
             if args.cookies:
-                with open(args.cookies, 'w') as f:
-                    json.dump(list(records.values()), f, indent=2)
+                # Atomic write + restrictive mode (same path as end-of-run
+                # save_cookies). Building a minimal session-like jar is
+                # unnecessary: persist the records dict via temp+replace.
+                _save_cookie_records_atomic(args.cookies, records)
                 print(f'  got a live session; saved cookies to {args.cookies}')
             else:
                 print('  got a live session (pass --cookies to save it for next time)')
@@ -3363,13 +3413,44 @@ async def amain():
     pdf_warn_state = {}  # print "ebook-convert missing" only once
     for job_index, (book_id, book_title) in enumerate(jobs, 1):
         args.book_id = book_id
+        # --title: fill empty list title from API metadata (list titles win)
+        if not book_title and getattr(args, 'title', False):
+            try:
+                timeout = aiohttp.ClientTimeout(
+                    total=float(CONFIG.get('http_timeout_total', 120)),
+                    connect=float(CONFIG.get('http_timeout_connect', 30)),
+                    sock_read=float(CONFIG.get('http_timeout_sock_read', 90)),
+                )
+                async with aiohttp.ClientSession(
+                    raise_for_status=False,
+                    headers=session_headers,
+                    timeout=timeout,
+                ) as title_session:
+                    apply_cookies_to_session(title_session, records)
+                    info = await fetch_book_info(title_session, book_id)
+                    if info.get('title'):
+                        book_title = info['title']
+                        print(f'  --title: using API title {book_title!r}')
+                    else:
+                        print('  --title: API returned no title; keeping book id name')
+            except Exception as exc:  # noqa: BLE001
+                print(f'  --title: could not fetch title ({type(exc).__name__}); '
+                      f'keeping book id name')
+
         print(f'\n======== [{job_index}/{len(jobs)}] {book_id}'
               + (f'  ({book_title})' if book_title else '')
               + ' ========')
         log.info('starting book %s title=%r', book_id, book_title)
 
         suffix = CONFIG.get('output_suffix') or ''
-        if args.raw:
+        # Prefer title for initial path when we already know it
+        if book_title:
+            safe = _sanitize_filename(book_title)
+            if args.raw:
+                base_name = f'{safe}-raw{suffix}.epub'
+            else:
+                base_name = f'{safe}{suffix}.epub'
+        elif args.raw:
             base_name = f'{book_id}-raw{suffix}.epub'
         else:
             base_name = f'{book_id}{suffix}.epub'
@@ -3506,6 +3587,11 @@ async def _download_one_book(args, records, session_headers, filename, tmp_filen
                             f'HTTP {status if status is not None else "no response"} '
                             f'- {detail}'
                         )
+                        if getattr(args, 'require_auth', False):
+                            raise RuntimeError(
+                                'Authentication failed and --require-auth is set '
+                                f'(HTTP {status if status is not None else "n/a"}: {detail})'
+                            )
                         if jwt_definitely_expired:
                             print(
                                 '  The expiry claim above confirms this token '
