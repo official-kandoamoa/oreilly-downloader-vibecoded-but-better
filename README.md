@@ -1,21 +1,24 @@
-## ⚖️ Legal Disclaimer
+## Legal disclaimer
 
 > [!CAUTION]
 > **This software is provided for educational and research purposes only.** The author(s) assume no liability or responsibility for any unauthorized, illegal, or unethical use of this project.
 
-### 1. No Liability
+### 1. No liability
+
 Under no circumstances shall the project owner, authors, or contributors be held liable for any direct, indirect, incidental, special, exemplary, or consequential damages. This includes, but is not limited to:
-* **Financial loss** or loss of profits
-* **Data corruption**, loss, or breach
-* **System downtime**, service interruptions, or hardware damage
-* **Legal consequences** resulting from your deployment or usage
 
-### 2. "As-Is" Basis
-This project is provided **"as is" and "as available"**, without warranty of any kind, express or implied. This includes warranties of merchantability, fitness for a particular purpose, or non-infringement. You assume all operational and technical risks by executing or modifying this code.
+- **Financial loss** or loss of profits  
+- **Data corruption**, loss, or breach  
+- **System downtime**, service interruptions, or hardware damage  
+- **Legal consequences** resulting from your deployment or usage  
 
-### 3. "Gray Area" Use Cases
-If this software is deployed in ambiguous, high-risk, or production environments, the user bears **100% of the responsibility** to ensure compliance with local laws, corporate policies, and third-party terms of service. 
+### 2. “As-is” basis
 
+This project is provided **“as is” and “as available”**, without warranty of any kind, express or implied. This includes warranties of merchantability, fitness for a particular purpose, or non-infringement. You assume all operational and technical risks by executing or modifying this code.
+
+### 3. Responsibility for use
+
+If this software is deployed in ambiguous, high-risk, or production environments, the user bears **100% of the responsibility** to ensure compliance with local laws, corporate policies, and third-party terms of service (including [O'Reilly’s Terms of Service](https://learning.oreilly.com/terms/)).
 
 > [!WARNING]
 > **AI development disclosure:** This project was developed with assistance from the free versions of ChatGPT, Grok, and Claude (LLMs), with the user providing ideas and testing while the AIs and user collaboratively suggested, generated, reviewed, and refined code and solutions.
@@ -92,9 +95,10 @@ python3 oreilly_downloader.py --version
 ### Authentication and session
 
 - Loads a full browser cookie export (domain, path, secure, httpOnly, expiry respected).
-- Writes cookies back **atomically** (temp file + `os.replace`) after each run so sessions can outlive a single short-lived `orm-jwt`.
+- Writes cookies back **atomically** (temp file + `os.replace`) after each run **and** after a successful `--webview` login, so sessions can outlive a single short-lived `orm-jwt` and a crash mid-write cannot truncate your only refresh token.
 - For `orm-jwt`, saves `expirationDate` from the JWT’s own `exp` claim (avoids dropping a freshly rotated token as “already expired”).
 - Optional `--jwt` for one-off use; optional `--webview` for interactive login (Akamai sensor cookies included).
+- Optional `--require-auth` to exit immediately when credentials are missing or the auth probe fails (no “continue anyway?” prompt).
 - Explains 401/403 failures in light of local JWT expiry claims vs Akamai Bot Manager.
 
 ### Robustness
@@ -113,6 +117,7 @@ python3 oreilly_downloader.py --version
 
 - Zero or more book ids on the command line: `978A 978B`.
 - `--books` / `books.txt` multi-title lists with optional display titles and automatic rename to sanitised titles.
+- `--title` names a single-book (or untitled list) download from the Learning API title instead of the numeric id; list titles still take precedence when present.
 - `--save-options` / `.oreilly_options.json` to remember `--cookies`, `--calibre`, etc. (**not** `--jwt`).
 - `--raw` archival dump; `--calibre` EPUB→EPUB polish; `--kindle` overflow CSS; **`--pdf` opt-in** PDF via Calibre (EPUB always kept).
 - No-argument invocation prints a quick reference; `--help` prints a detailed guide.
@@ -214,6 +219,7 @@ O'Reilly authenticates API calls primarily with the short-lived `orm-jwt` cookie
 - Sends each cookie only according to its domain/path/secure/expiry metadata.
 - Skips cookies that are already expired at load time (with a warning).
 - Writes the **current** jar back to the same file after the run, including any values the server rotated mid-download, using an **atomic** replace so a crash mid-write cannot truncate your only refresh token.
+- Uses the same atomic path after a successful **`--webview`** login (not a plain overwrite).
 - For `orm-jwt`, stores `expirationDate` from the token’s own `exp` claim.
 
 You can still pass `--jwt VALUE` alone or combined with `--cookies` (JWT overrides that one name).
@@ -246,7 +252,7 @@ Are you sure you want to continue without valid cookies or orm-jwt?
 This may generate a partial EPUB. [y/N]
 ```
 
-Use `--webview` to supply a session, or `--yes` to skip prompts in automation (not recommended unless you know the risk).
+Use `--webview` to supply a session, **`--require-auth`** to exit immediately with no prompt, or `--yes` to skip other safety prompts in automation (not recommended unless you know the risk).
 
 ---
 
@@ -271,6 +277,8 @@ python3 oreilly_downloader.py --books FILE [options]
 | `--calibre` | After a successful build, run Calibre `ebook-convert` (EPUB→EPUB). **Exits before download** if `ebook-convert` is missing. |
 | `--kindle` | Inject CSS so `table` / `pre` wrap and do not overflow on narrow Kindle / E-Ink screens. Ignored with `--raw`. |
 | `--pdf` | **Opt-in.** After each successful EPUB, also convert to PDF with Calibre. **Off by default.** EPUB is always kept. Missing Calibre → skip with a note (not a hard failure). |
+| `--title` | Name the output EPUB from the Learning API book title (sanitised) instead of the numeric id. Titles supplied in `--books` still take precedence when present. |
+| `--require-auth` | Exit immediately if there are no usable cookies/JWT or the auth probe fails. Skips “continue without credentials?” prompts. Useful for scripts and CI. |
 | `--no-nav` | Do not synthesise EPUB3 `nav.xhtml` (ignored in `--raw` mode). |
 | `--webview` | Interactive browser login when needed. |
 | `--webview-profile PATH` | Directory for the embedded browser profile. |
@@ -279,7 +287,7 @@ python3 oreilly_downloader.py --books FILE [options]
 | `--save-options` | After success (or alone with flags), save common options to the options file. |
 | `--print-options` | Print the saved options file and exit. |
 | `--skip-connectivity` | Skip site / API v2 probes. |
-| `-y`, `--yes` | Auto-confirm safety prompts (older Python, missing cookies, weak API probe). |
+| `-y`, `--yes` | Auto-confirm safety prompts (older Python, missing cookies, weak API probe). Does **not** override `--require-auth`. |
 | `--version` | Print version and exit. |
 | `-h`, `--help` | Full help text including the detailed guide. |
 
@@ -295,7 +303,7 @@ Invalid options or bad value formats exit with code `2`, a short explanation, an
 - Akamai injection stripped; OPF title/language aligned with API metadata when available.
 - Package document exposed as `EPUB/content.opf`.
 - Optional nav synthesis and `dcterms:modified`.
-- Output name: `<book_id>.epub` (or title-based name when using a list with titles).
+- Output name: `<book_id>.epub`, or title-based name when using `--title` or a list with titles.
 
 ### `--raw`
 
@@ -328,6 +336,14 @@ python3 oreilly_downloader.py 9780000000003 --cookies cookies.json --pdf
 
 After a successful EPUB (and optional title rename / `--calibre`), runs `ebook-convert` to `<same-stem>.pdf` with `--pretty-print`. The EPUB is **not** deleted. Default is **off**; enable with `--pdf` or `CONFIG['convert_pdf'] = True`.
 
+### `--title`
+
+```bash
+python3 oreilly_downloader.py 9780000000003 --cookies cookies.json --title
+```
+
+Fetches the book title from the Learning API and names the file with the same sanitisation rules as list titles. If the API returns no title, the numeric id name is kept (with a warning).
+
 ---
 
 ## Batch download
@@ -353,12 +369,13 @@ Rules:
 | Book id | Digits only |
 | Multiple `#` | Line rejected (`jeleo # 83hd # heoo`) |
 | Non-numeric id | Line rejected (`jfjd # ejsk`) |
-| Titles | Optional quotes; sanitised for Windows / Linux / Android file names |
+| Titles | Optional quotes; sanitised for Windows / Linux / Android file names. **Must not contain `#`** (only one `#` separator is allowed per line). |
 
 ```bash
 python3 oreilly_downloader.py --books books.txt --cookies cookies.json
 python3 oreilly_downloader.py 9780000000001 9780000000002 --cookies cookies.json
 python3 oreilly_downloader.py --books books.txt --cookies cookies.json --calibre --pdf
+python3 oreilly_downloader.py 9780000000001 --cookies cookies.json --title --require-auth
 ```
 
 If one book fails, the script writes an error log, continues with the next book, and exits with code **1** if any book failed.
@@ -377,7 +394,7 @@ Prefers `uv run` when `uv` is on `PATH`, else `python3` / `python`.
 
 ### Title sanitisation
 
-When a title is provided, the finished EPUB is renamed to `<sanitised-title>.epub` (or `<sanitised-title>-raw.epub` with `--raw`):
+When a title is provided (list file or `--title`), the finished EPUB is named `<sanitised-title>.epub` (or `<sanitised-title>-raw.epub` with `--raw`):
 
 - Long `Title: Subtitle …` strings keep only the part before the first colon when that colon is after position 15 (safaribooks-style).
 - Unsafe characters (`~ # % & * { } \ < > ? / ` ' " | + ; :` and path separators) become underscores.
@@ -575,6 +592,7 @@ This script is built for **API version 2** (`/api/v2/epubs/urn:orm:book:…/file
 | Any missing file after the download phase | **Not** treated as success — error raised for that book |
 | Multi-book: one book fails | Error log written; remaining books still run; process exit code **1** if any failed |
 | Redirect to non-allowlisted host | Request refused |
+| `--require-auth` and failed / missing auth | Immediate non-zero exit (no download) |
 
 ---
 
@@ -588,7 +606,7 @@ These are always on unless you deliberately change `CONFIG` (there is **no** `--
 | Hosts | Only hosts under `CONFIG['allowed_hosts']` (default `oreilly.com` and `learning.oreilly.com`, including subdomains). Redirect hops are checked the same way. |
 | Timeouts | `http_timeout_connect` / `http_timeout_sock_read` / `http_timeout_total` apply to every API request. |
 | Size | Each response is capped by `max_response_bytes` (default 80 MiB). |
-| Cookies file | Atomic write + Unix mode `cookies_file_mode` (default `0o600`). |
+| Cookies file | Atomic write + Unix mode `cookies_file_mode` (default `0o600`), including after `--webview`. |
 | Logs | JWTs (`eyJ…`) and long opaque tokens are replaced with `[REDACTED_…]` in `--log` files and `error_logs/*`. |
 | CLI log | If you pass `--jwt`, the value is stored as `[REDACTED]` in structured debug logs. |
 | Subprocess | `ebook-convert` is started with an argument list only (`shell=False`). |
@@ -606,10 +624,10 @@ These are always on unless you deliberately change `CONFIG` (there is **no** `--
 | Missing `aiohttp` / `lxml` / `yarl` | Exit with install commands |
 | Unwritable output, cache, or cookies path | Exit with permission hint |
 | `--calibre` but no `ebook-convert` | Exit before download + link to Calibre’s site |
-| No cookies / no orm-jwt | Confirm before download |
+| No cookies / no orm-jwt | Confirm before download; **`--require-auth` exits instead** |
 | API probe failed | Explain + confirm |
 
-Use `-y` / `--yes` to auto-accept interactive confirms in CI or wrappers (use carefully).
+Use `-y` / `--yes` to auto-accept interactive confirms in CI or wrappers (use carefully). `--require-auth` is separate and still fails closed on bad auth.
 
 ---
 
@@ -665,9 +683,9 @@ ebook-convert "9780000000005.epub" "9780000000005.pdf" --pretty-print
 
 For Amazon Kindle and other narrow E-Ink screens, wide tables and preformatted code often overflow or clip. **`--kindle`** injects `Styles/kindle-fix.css` that:
 
-- Applies word-wrap / word-break broadly
-- Sets `table` / `pre` overflow to unset and `white-space: pre-wrap`
-- Caps `img` / `svg` to `max-width: 100%`
+- Applies word-wrap / word-break broadly  
+- Sets `table` / `pre` overflow to unset and `white-space: pre-wrap`  
+- Caps `img` / `svg` to `max-width: 100%`  
 
 ```bash
 python3 oreilly_downloader.py 9780000000005 --cookies cookies.json --kindle
@@ -690,8 +708,8 @@ Workflow notes adapted from [lorenzodifuccia/safaribooks](https://github.com/lor
 1. **Bootstrap** — Python version floor, dependency imports, optional soft prompts after CLI parse.  
 2. **Resolve jobs** — Positional book ids and/or `--books` / CONFIG list; validate id format.  
 3. **Connectivity** — Site + API v2 probes.  
-4. **Authenticate** — Load cookies/JWT; optional webview; consent if unauthenticated.  
-5. **Per book** — Reset 403 guard; fetch metadata; list files; concurrent download with cache; rewrite (unless `--raw`); nav / OPF / Kindle CSS; zip; atomic rename; optional title rename; optional `--calibre`; optional `--pdf`.  
+4. **Authenticate** — Load cookies/JWT; optional webview; consent or `--require-auth`.  
+5. **Per book** — Optional `--title` metadata; reset 403 guard; list files; concurrent download with cache; rewrite (unless `--raw`); nav / OPF / Kindle CSS; zip; atomic rename; optional `--calibre`; optional `--pdf`.  
 6. **Exit** — 0 only if every book succeeded; otherwise 1.
 
 ---
@@ -709,8 +727,9 @@ Workflow notes adapted from [lorenzodifuccia/safaribooks](https://github.com/lor
 | Persistent 403 / session aborted | Re-export cookies; lower `--concurrency`; wait and retry |
 | `--calibre` errors at start | Install Calibre and ensure `ebook-convert` is on `PATH` |
 | `--pdf` does nothing | Flag is **opt-in** — pass `--pdf`; install Calibre |
+| `--require-auth` exits immediately | Provide valid `--cookies` / `--jwt`, or use `--webview` without `--require-auth` while testing |
 | Permission denied writing files | Fix directory permissions; on Android/Termux grant storage access |
-| Invalid sources line | Digits-only id; single `#`; see books.txt rules |
+| Invalid sources line | Digits-only id; single `#`; no `#` inside the title; see books.txt rules |
 | Need support | Attach a redacted `--log` file and open an Issue at the GitHub link above |
 
 ---
@@ -722,6 +741,7 @@ Workflow notes adapted from [lorenzodifuccia/safaribooks](https://github.com/lor
 - Cookie lifetime follows the real login session; when the session is fully dead, export again or use `--webview`.
 - Cache growth is unbounded until you delete `.oreilly_cache/`.
 - `--raw` packages are archival; they may not open cleanly in all readers without Calibre or the default rewrite mode.
+- Titles in `books.txt` cannot contain `#` (format limitation).
 - This is not an official O'Reilly product.
 
 ---
@@ -759,7 +779,7 @@ When reporting a bug, include:
 
 - Script version (`--version`)
 - OS and Python version
-- Whether you used `--cookies`, `--webview`, `--raw`, `--calibre`, `--pdf`, `--kindle`
+- Whether you used `--cookies`, `--webview`, `--raw`, `--calibre`, `--pdf`, `--kindle`, `--title`, `--require-auth`
 - A **redacted** log from `--log` (secrets are stripped, but review before uploading)
 - The exact command line (omit JWT values)
 
