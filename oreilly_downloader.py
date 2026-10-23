@@ -2201,13 +2201,6 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                         failed.append(full_path)
                         done += 1
                     return
-                trunc = content_looks_truncated(result, content)
-                if trunc:
-                    print(f'FAILED {full_path}: {trunc}')
-                    async with progress_lock:
-                        failed.append(full_path)
-                        done += 1
-                    return
                 # Never persist an empty payload — a bad 200 must not poison
                 # the cache after the server recovers.
                 if content:
@@ -2218,6 +2211,20 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                         # Cache is best-effort; a write failure must not abort
                         # a successful download.
                         print(f'  warning: could not cache {full_path}: {exc}')
+
+        # Preview truncation (cache or network). Drop poisoned cache entries.
+        trunc = content_looks_truncated(result, content)
+        if trunc:
+            print(f'FAILED {full_path}: {trunc}')
+            try:
+                if cache_path.is_file():
+                    cache_path.unlink()
+            except OSError:
+                pass
+            async with progress_lock:
+                failed.append(full_path)
+                done += 1
+            return
 
         try:
             if full_path.lower().endswith(HTML_EXTENSIONS):
@@ -2944,15 +2951,28 @@ def write_error_log(exc, *, context=''):
                 type(exc), exc, exc.__traceback__))
             f.write(_redact_secrets(tb))
         _chmod_private(path)
-        print(f'error: unexpected failure ({type(exc).__name__}: {exc})',
-              file=sys.stderr)
-        print(f'  details saved to {path}', file=sys.stderr)
-        print(
-            '  If this looks like a bug, please open an Issue on GitHub:\n'
-            f'    {REPORT_URL}',
-            file=sys.stderr,
+        msg = str(exc)
+        expected = isinstance(exc, RuntimeError) and (
+            'partial' in msg.lower()
+            or 'preview' in msg.lower()
+            or 'truncated' in msg.lower()
+            or 'early release' in msg.lower()
+            or 'missing' in msg.lower()
         )
-        log.exception('unexpected error (saved to %s)', path)
+        if expected:
+            print(f'error: {exc}', file=sys.stderr)
+            print(f'  details saved to {path}', file=sys.stderr)
+            log.error('book failed: %s', exc)
+        else:
+            print(f'error: unexpected failure ({type(exc).__name__}: {exc})',
+                  file=sys.stderr)
+            print(f'  details saved to {path}', file=sys.stderr)
+            print(
+                '  If this looks like a bug, please open an Issue on GitHub:\n'
+                f'    {REPORT_URL}',
+                file=sys.stderr,
+            )
+            log.exception('unexpected error (saved to %s)', path)
         return path
     except OSError as e:
         print(f'error: unexpected failure ({type(exc).__name__}: {exc})',
