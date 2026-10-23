@@ -27,7 +27,7 @@ If this software is deployed in ambiguous, high-risk, or production environments
 
 # O'Reilly EPUB downloader
 
-**Version:** 1.2.0
+**Version:** 1.3.0
 
 O'Reilly Learning (formerly Safari Books Online) serves its library through a web reader. This project downloads the individual files that make up a book **you already have access to** and rebuilds them into a normal, standalone `.epub` you can open in any reader — desktop, mobile, e-ink, or accessibility tools the built-in reader may not support well.
 
@@ -99,6 +99,7 @@ python3 oreilly_downloader.py --version
 - For `orm-jwt`, saves `expirationDate` from the JWT’s own `exp` claim (avoids dropping a freshly rotated token as “already expired”).
 - Optional `--jwt` for one-off use; optional `--webview` for interactive login (Akamai sensor cookies included).
 - Optional `--require-auth` to exit immediately when credentials are missing or the auth probe fails (no “continue anyway?” prompt).
+- **Automatic `orm-jwt` renewal** when `orm-rt` is present: if the JWT is within `jwt_refresh_margin` seconds of expiry, the script can wait for expiry (O'Reilly often only mints a new token after the old one dies), call `GET /profile/` with both cookies, and write the new JWT back to the cookies file.
 - Explains 401/403 failures in light of local JWT expiry claims vs Akamai Bot Manager.
 
 ### Robustness
@@ -112,11 +113,16 @@ python3 oreilly_downloader.py --version
 - Host allowlist on every request **and** every redirect hop; HTTP timeouts; per-response size cap.
 - Path-traversal-safe cache keys.
 - If any listed file is still missing after retries, the book is a **failure** (not exit 0 with a partial EPUB).
+- **Preview / truncation detection:** compares downloaded HTML size to the API `file_size`. Short chapters or a whole book under `book_html_min_ratio` of declared HTML size fail (typical of unauthenticated or preview-only access that still returns HTTP 200).
+- **EPUB verification** before promoting `.partial`: zip CRC, `mimetype`, and `container.xml` → OPF present.
+- **Early Release** (`roughcut`) books are refused unless `--allow-early-release`.
 
 ### Convenience
 
-- Zero or more book ids on the command line: `978A 978B`.
-- `--books` / `books.txt` multi-title lists with optional display titles and automatic rename to sanitised titles.
+- Zero or more book ids **or full Learning book URLs** on the command line.
+- `--books` / `books.txt` multi-title lists with optional display titles and automatic rename to sanitised titles; list lines may also use Learning URLs.
+- Optional polite pacing: `--max-books`, `--pause-min` / `--pause-max` between books (defaults off).
+- `--skip-existing` skips a book when the target `.epub` is already present (unless `--force`).
 - `--title` names a single-book (or untitled list) download from the Learning API title instead of the numeric id; list titles still take precedence when present.
 - `--save-options` / `.oreilly_options.json` to remember `--cookies`, `--calibre`, etc. (**not** `--jwt`).
 - `--raw` archival dump; `--calibre` EPUB→EPUB polish; `--kindle` overflow CSS; **`--pdf` opt-in** PDF via Calibre (EPUB always kept).
@@ -233,6 +239,16 @@ Accepted:
 
 The file written back is the full list shape (extension-friendly), mode `0600` on Unix (`CONFIG['cookies_file_mode']`).
 
+### Automatic JWT renewal
+
+When `orm-rt` is in the cookie jar and `orm-jwt` has less than `CONFIG['jwt_refresh_margin']` seconds left (default **180**):
+
+1. If the token is still live, the script may **wait** until shortly after expiry (O'Reilly often will not issue a new JWT while the old one is still valid).
+2. It requests `https://learning.oreilly.com/profile/` with both `orm-rt` and `orm-jwt`.
+3. On success, the new `orm-jwt` (and `orm-rt` if rotated) is applied to the session and saved atomically to `--cookies`.
+
+Disable with `CONFIG['auto_refresh_jwt'] = False`. If renewal fails, re-export cookies or use `--webview`.
+
 ### `--webview`
 
 Use when exports keep failing or Akamai blocks scripted requests:
@@ -265,7 +281,7 @@ python3 oreilly_downloader.py --books FILE [options]
 
 | Argument | Description |
 | --- | --- |
-| `BOOK_ID …` | Zero or more numeric ids from the Learning URL (digits only). Example: `9780000000001 9780000000002`. Optional when `--books` is set or a `CONFIG` books file exists. |
+| `BOOK_ID …` | Zero or more numeric ids **or** full `learning.oreilly.com` book URLs. Example: `9780000000001` or `https://learning.oreilly.com/library/view/title/9780000000002/`. Optional when `--books` is set or a `CONFIG` books file exists. |
 | `--cookies PATH` | Path to cookie JSON. Preferred auth method. |
 | `--jwt VALUE` | `orm-jwt` string only; short-lived. **Never** written to the saved-options file. |
 | `--books FILE` | Download every valid line in FILE (see [Batch download](#batch-download)). |
@@ -279,6 +295,11 @@ python3 oreilly_downloader.py --books FILE [options]
 | `--pdf` | **Opt-in.** After each successful EPUB, also convert to PDF with Calibre. **Off by default.** EPUB is always kept. Missing Calibre → skip with a note (not a hard failure). |
 | `--title` | Name the output EPUB from the Learning API book title (sanitised) instead of the numeric id. Titles supplied in `--books` still take precedence when present. |
 | `--require-auth` | Exit immediately if there are no usable cookies/JWT or the auth probe fails. Skips “continue without credentials?” prompts. Useful for scripts and CI. |
+| `--max-books N` | Process at most N books this run (`0` = no limit). Re-run later to continue a long list. |
+| `--pause-min SEC` / `--pause-max SEC` | Random pause between books (seconds). Default **0** (no pause). Example: `--pause-min 45 --pause-max 120`. |
+| `--no-size-check` | Disable truncated-chapter / preview detection against API `file_size`. |
+| `--allow-early-release` | Allow Early Release (rough cut) books the API marks unfinished. |
+| `--skip-existing` | Skip when the target `.epub` already exists (unless `--force`). |
 | `--no-nav` | Do not synthesise EPUB3 `nav.xhtml` (ignored in `--raw` mode). |
 | `--webview` | Interactive browser login when needed. |
 | `--webview-profile PATH` | Directory for the embedded browser profile. |
@@ -366,16 +387,19 @@ Rules:
 | Rule | Detail |
 | --- | --- |
 | Separator | A single `#` between id and optional title |
-| Book id | Digits only |
+| Book id | Digits **or** a full Learning book URL (id is extracted) |
 | Multiple `#` | Line rejected (`jeleo # 83hd # heoo`) |
-| Non-numeric id | Line rejected (`jfjd # ejsk`) |
+| Unparseable id/URL | Line rejected |
 | Titles | Optional quotes; sanitised for Windows / Linux / Android file names. **Must not contain `#`** (only one `#` separator is allowed per line). |
 
 ```bash
 python3 oreilly_downloader.py --books books.txt --cookies cookies.json
 python3 oreilly_downloader.py 9780000000001 9780000000002 --cookies cookies.json
+python3 oreilly_downloader.py "https://learning.oreilly.com/library/view/example/9780000000003/" --cookies cookies.json
 python3 oreilly_downloader.py --books books.txt --cookies cookies.json --calibre --pdf
 python3 oreilly_downloader.py 9780000000001 --cookies cookies.json --title --require-auth
+# Long lists, polite pacing (optional):
+python3 oreilly_downloader.py --books books.txt --cookies cookies.json --max-books 10 --pause-min 45 --pause-max 120
 ```
 
 If one book fails, the script writes an error log, continues with the next book, and exits with code **1** if any book failed.
@@ -465,6 +489,19 @@ CONFIG = {
     'check_connectivity': True,
     'options_file': '.oreilly_options.json',
     'auto_save_options': False,
+
+    # Session / pacing / completeness (v1.3+)
+    'auto_refresh_jwt': True,
+    'jwt_refresh_margin': 180,
+    'detect_truncated': True,
+    'html_min_size_ratio': 0.85,
+    'html_min_declared_bytes': 2000,
+    'book_html_min_ratio': 0.93,
+    'pause_between_books_min': 0,
+    'pause_between_books_max': 0,
+    'max_books_per_run': 0,
+    'verify_epub': True,
+    'skip_existing': False,
 }
 ```
 
@@ -515,6 +552,21 @@ CONFIG = {
 | --- | --- | --- | --- |
 | `auto_save_options` | `bool` | `False` | When `True`, after every **successful** multi-book run the script writes current common flags to `options_file`. **Never** stores `--jwt`. |
 
+### Session, pacing, and completeness (v1.3+)
+
+| Key | Type | Default | Detail |
+| --- | --- | --- | --- |
+| `auto_refresh_jwt` | `bool` | `True` | When `True`, renew `orm-jwt` via `/profile/` if close to expiry and `orm-rt` is available. |
+| `jwt_refresh_margin` | `int` (seconds) | `180` | Trigger renewal when remaining JWT life is below this. |
+| `detect_truncated` | `bool` | `True` | Compare HTML download sizes to API `file_size`; fail previews. Disable with `--no-size-check`. |
+| `html_min_size_ratio` | `float` | `0.85` | Per-chapter: fail if `got < ratio * declared` and declared ≥ `html_min_declared_bytes`. |
+| `html_min_declared_bytes` | `int` | `2000` | Minimum declared size before the per-chapter ratio check applies. |
+| `book_html_min_ratio` | `float` | `0.93` | Whole book: fail if total HTML bytes &lt; ratio × total declared HTML. |
+| `pause_between_books_min` / `max` | `float` | `0` / `0` | Random pause between books (seconds). `0` = no pause. CLI: `--pause-min` / `--pause-max`. |
+| `max_books_per_run` | `int` | `0` | Cap books per invocation (`0` = unlimited). CLI: `--max-books`. |
+| `verify_epub` | `bool` | `True` | After build, verify zip/mimetype/container before renaming `.partial`. |
+| `skip_existing` | `bool` | `False` | Skip when target `.epub` exists. CLI: `--skip-existing`. |
+
 ### Precedence (what wins?)
 
 From lowest to highest priority:
@@ -544,6 +596,11 @@ CONFIG['http_timeout_sock_read'] = 180
 
 # Remember last flags without typing --save-options
 CONFIG['auto_save_options'] = True
+
+# Polite long lists (optional; defaults are off)
+CONFIG['max_books_per_run'] = 10
+CONFIG['pause_between_books_min'] = 45
+CONFIG['pause_between_books_max'] = 120
 ```
 
 ---
@@ -593,6 +650,9 @@ This script is built for **API version 2** (`/api/v2/epubs/urn:orm:book:…/file
 | Multi-book: one book fails | Error log written; remaining books still run; process exit code **1** if any failed |
 | Redirect to non-allowlisted host | Request refused |
 | `--require-auth` and failed / missing auth | Immediate non-zero exit (no download) |
+| Truncated HTML vs API `file_size` (preview) | Chapter / book fails; not treated as success |
+| Early Release without `--allow-early-release` | Book refused |
+| EPUB verification failed | `.partial` discarded; book fails |
 
 ---
 
@@ -708,8 +768,8 @@ Workflow notes adapted from [lorenzodifuccia/safaribooks](https://github.com/lor
 1. **Bootstrap** — Python version floor, dependency imports, optional soft prompts after CLI parse.  
 2. **Resolve jobs** — Positional book ids and/or `--books` / CONFIG list; validate id format.  
 3. **Connectivity** — Site + API v2 probes.  
-4. **Authenticate** — Load cookies/JWT; optional webview; consent or `--require-auth`.  
-5. **Per book** — Optional `--title` metadata; reset 403 guard; list files; concurrent download with cache; rewrite (unless `--raw`); nav / OPF / Kindle CSS; zip; atomic rename; optional `--calibre`; optional `--pdf`.  
+4. **Authenticate** — Load cookies/JWT; optional JWT renewal via `/profile/`; optional webview; consent or `--require-auth`.  
+5. **Per book** — Optional `--title` metadata; skip if `--skip-existing`; reset 403 guard; list files; concurrent download with cache; size/preview checks; rewrite (unless `--raw`); nav / OPF / Kindle CSS; zip; verify; atomic rename; optional `--calibre` / `--pdf`; optional pause before next book.  
 6. **Exit** — 0 only if every book succeeded; otherwise 1.
 
 ---
@@ -728,8 +788,11 @@ Workflow notes adapted from [lorenzodifuccia/safaribooks](https://github.com/lor
 | `--calibre` errors at start | Install Calibre and ensure `ebook-convert` is on `PATH` |
 | `--pdf` does nothing | Flag is **opt-in** — pass `--pdf`; install Calibre |
 | `--require-auth` exits immediately | Provide valid `--cookies` / `--jwt`, or use `--webview` without `--require-auth` while testing |
+| Preview / truncated chapter errors | Full subscription required; re-export cookies; avoid `--no-size-check` unless debugging |
+| Early Release refused | Pass `--allow-early-release` only if you accept unfinished content |
+| JWT keeps expiring mid-run | Ensure `orm-rt` is in the cookie export so auto-renewal can run |
 | Permission denied writing files | Fix directory permissions; on Android/Termux grant storage access |
-| Invalid sources line | Digits-only id; single `#`; no `#` inside the title; see books.txt rules |
+| Invalid sources line | Digits or Learning URL; single `#`; no `#` inside the title; see books.txt rules |
 | Need support | Attach a redacted `--log` file and open an Issue at the GitHub link above |
 
 ---
@@ -742,6 +805,7 @@ Workflow notes adapted from [lorenzodifuccia/safaribooks](https://github.com/lor
 - Cache growth is unbounded until you delete `.oreilly_cache/`.
 - `--raw` packages are archival; they may not open cleanly in all readers without Calibre or the default rewrite mode.
 - Titles in `books.txt` cannot contain `#` (format limitation).
+- Preview-size detection can false-positive on unusual packages; use `--no-size-check` only when you understand the risk.
 - This is not an official O'Reilly product.
 
 ---
@@ -779,7 +843,7 @@ When reporting a bug, include:
 
 - Script version (`--version`)
 - OS and Python version
-- Whether you used `--cookies`, `--webview`, `--raw`, `--calibre`, `--pdf`, `--kindle`, `--title`, `--require-auth`
+- Whether you used `--cookies`, `--webview`, `--raw`, `--calibre`, `--pdf`, `--kindle`, `--title`, `--require-auth`, `--max-books`, `--no-size-check`, `--allow-early-release`
 - A **redacted** log from `--log` (secrets are stripped, but review before uploading)
 - The exact command line (omit JWT values)
 

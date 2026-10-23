@@ -131,7 +131,7 @@ SUPPORTED_OS = ('Linux', 'Windows')
 # Official creator — please open a GitHub Issue here when reporting bugs:
 REPORT_URL = 'https://github.com/official-kandoamoa'
 CALIBRE_URL = 'https://calibre-ebook.com/'
-SCRIPT_VERSION = '1.2.0'
+SCRIPT_VERSION = '1.3.0'
 
 
 def _die(msg, code=1):
@@ -377,6 +377,25 @@ CONFIG = {
     'auto_save_options': False,
     # After each successful EPUB, also write a PDF via Calibre when available
     'convert_pdf': False,
+
+    # --- session / pacing / completeness ---
+    # Renew orm-jwt via GET /profile/ when close to expiry (needs orm-rt).
+    'auto_refresh_jwt': True,
+    'jwt_refresh_margin': 180,
+    # Detect truncated chapter bodies (preview access) using API file_size.
+    'detect_truncated': True,
+    'html_min_size_ratio': 0.85,
+    'html_min_declared_bytes': 2000,
+    'book_html_min_ratio': 0.93,
+    # Random pause between books (seconds). 0/0 = no pause.
+    'pause_between_books_min': 0,
+    'pause_between_books_max': 0,
+    # Cap books per run (0 = no limit).
+    'max_books_per_run': 0,
+    # Structural check of finished EPUB before promoting .partial.
+    'verify_epub': True,
+    # Skip when target .epub already exists (unless --force).
+    'skip_existing': False,
 }
 # =============================================================================
 
@@ -1692,6 +1711,182 @@ def _best_jwt_from_jar(session):
 
 
 
+
+def parse_book_id(text):
+    """Extract a digit-only book id from a raw id or Learning URL."""
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return s
+    m = re.search(r'/(\d{5,})/?', s)
+    if m:
+        return m.group(1)
+    m = re.search(r'urn:orm:book:(\d+)', s)
+    if m:
+        return m.group(1)
+    m = re.search(r'(\d{10,})', s)
+    if m:
+        return m.group(1)
+    return None
+
+
+def content_looks_truncated(entry, content):
+    """Return a reason if bytes look like a truncated preview chapter."""
+    if not CONFIG.get('detect_truncated', True):
+        return None
+    if content is None:
+        return 'empty'
+    got = len(content)
+    if got == 0:
+        return 'empty'
+    want = int(entry.get('file_size') or 0)
+    if want <= 0:
+        return None
+    path = (entry.get('full_path') or '').lower()
+    is_html = path.endswith(HTML_EXTENSIONS) or str(
+        entry.get('media_type') or '').startswith('text/html')
+    if is_html:
+        min_decl = int(CONFIG.get('html_min_declared_bytes', 2000))
+        ratio = float(CONFIG.get('html_min_size_ratio', 0.85))
+        if want >= min_decl and got < want * ratio:
+            return f'truncated chapter ({got}/{want} bytes)'
+    return None
+
+
+def verify_epub_package(epub_path):
+    """Light structural checks; raises ValueError if the package is unusable."""
+    if not CONFIG.get('verify_epub', True):
+        return
+    with zipfile.ZipFile(epub_path, 'r') as zf:
+        bad = zf.testzip()
+        if bad is not None:
+            raise ValueError(f'corrupt zip member: {bad}')
+        names = set(zf.namelist())
+        if 'mimetype' not in names:
+            raise ValueError('missing mimetype')
+        raw = zf.read('mimetype')
+        if raw.strip() != b'application/epub+zip':
+            raise ValueError(f'bad mimetype payload: {raw[:40]!r}')
+        if 'META-INF/container.xml' not in names:
+            raise ValueError('missing META-INF/container.xml')
+        try:
+            cont = zf.read('META-INF/container.xml')
+            root = etree.fromstring(cont)
+            full = root.find(
+                './/{urn:oasis:names:tc:opendocument:xmlns:container}rootfile'
+            )
+            opf_path = full.get('full-path') if full is not None else None
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f'container.xml unreadable: {exc}') from exc
+        if not opf_path or opf_path not in names:
+            raise ValueError(f'container OPF missing in zip: {opf_path!r}')
+
+
+async def refresh_jwt_via_profile(session, records):
+    """Obtain a new orm-jwt using orm-rt + current orm-jwt via /profile/."""
+    jwt = (records.get('orm-jwt') or {}).get('value') or ''
+    rt = (records.get('orm-rt') or {}).get('value') or ''
+    if not rt:
+        return False
+    url = BASE_URL + '/profile/'
+    _assert_url_allowed(url)
+    headers = {
+        'User-Agent': DEFAULT_HEADERS.get('User-Agent', 'Mozilla/5.0'),
+        'Accept': 'text/html,application/xhtml+xml',
+        'Cookie': f'orm-rt={rt}; orm-jwt={jwt}' if jwt else f'orm-rt={rt}',
+    }
+    try:
+        async with session.get(
+            url,
+            headers=headers,
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=30, connect=15),
+        ) as r:
+            new_jwt = None
+            new_rt = None
+            for cookie in session.cookie_jar:
+                if cookie.key == 'orm-jwt' and cookie.value:
+                    new_jwt = cookie.value
+                if cookie.key == 'orm-rt' and cookie.value:
+                    new_rt = cookie.value
+            if not new_jwt:
+                for h in r.headers.getall('Set-Cookie', []):
+                    name, _, rest = h.partition('=')
+                    name = name.strip()
+                    val = rest.split(';', 1)[0]
+                    if name == 'orm-jwt' and val:
+                        new_jwt = val
+                    elif name == 'orm-rt' and val:
+                        new_rt = val
+            status = r.status
+    except Exception as exc:  # noqa: BLE001
+        log.warning('jwt refresh request failed: %s', exc)
+        return False
+
+    if not new_jwt:
+        log.warning('jwt refresh: no orm-jwt in response (HTTP %s)', status)
+        return False
+    rem = _jwt_remaining(new_jwt)
+    if rem is not None and rem <= 0:
+        log.warning('jwt refresh: server returned already-expired token')
+        return False
+    records['orm-jwt'] = _make_record('orm-jwt', new_jwt, secure=True)
+    if new_rt:
+        records['orm-rt'] = _make_record(
+            'orm-rt', new_rt, secure=True, httpOnly=True
+        )
+    try:
+        jar_update = {'orm-jwt': new_jwt}
+        if new_rt:
+            jar_update['orm-rt'] = new_rt
+        session.cookie_jar.update_cookies(
+            jar_update, response_url=yarl.URL(BASE_URL + '/')
+        )
+    except Exception:  # noqa: BLE001
+        apply_cookies_to_session(session, records)
+    print(
+        '  renewed orm-jwt via /profile/'
+        + (f' (valid ~{rem // 60}m)' if rem and rem > 0 else '')
+    )
+    return True
+
+
+async def maybe_refresh_jwt(session, records, cookies_path=None, margin=None):
+    """Refresh orm-jwt when close to expiry and orm-rt is available."""
+    if not CONFIG.get('auto_refresh_jwt', True):
+        return False
+    if margin is None:
+        margin = int(CONFIG.get('jwt_refresh_margin', 180))
+    jwt = (records.get('orm-jwt') or {}).get('value') or ''
+    rt = (records.get('orm-rt') or {}).get('value') or ''
+    if not jwt and not rt:
+        return False
+    rem = _jwt_remaining(jwt) if jwt else -1
+    if rem is not None and rem >= margin:
+        return False
+    if not rt:
+        if rem is not None and rem < margin:
+            print(
+                f'  orm-jwt expires in {rem}s and no orm-rt cookie is available '
+                f'to renew it — re-export cookies if downloads fail'
+            )
+        return False
+    if rem is not None and rem > 0:
+        wait_for = min(rem + 2, max(margin, 5))
+        print(f'  orm-jwt expires in {rem}s — waiting {wait_for}s before renewal…')
+        await asyncio.sleep(wait_for)
+    ok = await refresh_jwt_via_profile(session, records)
+    if ok and cookies_path:
+        try:
+            save_cookies(cookies_path, records, session)
+        except Exception as exc:  # noqa: BLE001
+            print(f'  warning: could not save renewed cookies: {exc}')
+    return ok
+
+
 async def check_site_online(session):
     """Return (online: bool, detail: str) for learning.oreilly.com reachability."""
     url = BASE_URL + '/'
@@ -1945,8 +2140,16 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
         results.extend(data.get('results', []))
         url = data.get('next')
 
+    if book_info.get('roughcut') and not getattr(fetch_book, '_allow_early', False):
+        raise RuntimeError(
+            'Early Release (rough cut) book — unfinished content. '
+            'Pass --allow-early-release to download anyway.'
+        )
+
     css_paths = [r['full_path'] for r in results if r['full_path'].endswith('.css')]
     total = len(results)
+    html_declared = 0
+    html_got = 0
     cache_root = Path(cache_dir or DEFAULT_CACHE_DIR) / str(book_id)
     cache_root.mkdir(parents=True, exist_ok=True)
 
@@ -1962,7 +2165,7 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
     progress_lock = asyncio.Lock()
 
     async def download(result, sem):
-        nonlocal done, cached_hits
+        nonlocal done, cached_hits, html_declared, html_got
         full_path = result['full_path']
         try:
             cache_path = _safe_cache_path(cache_root, full_path)
@@ -1998,6 +2201,13 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                         failed.append(full_path)
                         done += 1
                     return
+                trunc = content_looks_truncated(result, content)
+                if trunc:
+                    print(f'FAILED {full_path}: {trunc}')
+                    async with progress_lock:
+                        failed.append(full_path)
+                        done += 1
+                    return
                 # Never persist an empty payload — a bad 200 must not poison
                 # the cache after the server recovers.
                 if content:
@@ -2008,6 +2218,17 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
                         # Cache is best-effort; a write failure must not abort
                         # a successful download.
                         print(f'  warning: could not cache {full_path}: {exc}')
+
+        try:
+            if full_path.lower().endswith(HTML_EXTENSIONS):
+                want = int(result.get('file_size') or 0)
+                got = len(content) if content is not None else 0
+                async with progress_lock:
+                    if want > 0:
+                        html_declared += want
+                    html_got += got
+        except Exception:  # noqa: BLE001
+            pass
 
         # --raw: keep API bytes and original path, zero transformation.
         out_path = full_path
@@ -2125,6 +2346,18 @@ async def fetch_book(book_id, zfh, session, concurrency=DEFAULT_CONCURRENCY,
     # Single-threaded write after gather — ZipFile is not concurrent-safe.
     for out_path, content in members.items():
         zfh.writestr(f'EPUB/{out_path}', content)
+
+    # Whole-book preview detection: sum of HTML chapter sizes.
+    ratio = float(CONFIG.get('book_html_min_ratio', 0.93))
+    if (
+        CONFIG.get('detect_truncated', True)
+        and html_declared > 0
+        and html_got < html_declared * ratio
+    ):
+        raise RuntimeError(
+            f'partial/preview book: HTML chapters total {html_got}/{html_declared} bytes '
+            f'({html_got / html_declared:.0%}); need full subscription access'
+        )
 
     if failed:
         print()
@@ -2756,11 +2989,12 @@ def parse_books_file(path):
                     title = title[1:-1].strip()
             else:
                 book_id, title = line, ''
-            if not book_id.isdigit():
-                print(f'error: {path}:{lineno}: book id must be digits only: {raw.rstrip()}',
+            parsed = parse_book_id(book_id)
+            if not parsed:
+                print(f'error: {path}:{lineno}: not a book id or Learning URL: {raw.rstrip()}',
                       file=sys.stderr)
                 continue
-            yield book_id, title
+            yield parsed, title
 
 
 
@@ -2769,9 +3003,9 @@ def _validate_cli_args(args):
     errors = []
 
     for _bid in list(getattr(args, 'book_ids', None) or []):
-        if not str(_bid).isdigit():
+        if not parse_book_id(_bid):
             errors.append(
-                f'book id must be digits only (ISBN-style), got {_bid!r}'
+                f'book id must be digits or a learning.oreilly.com URL, got {_bid!r}'
             )
 
     if args.concurrency is not None:
@@ -3028,7 +3262,7 @@ async def amain():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('book_ids', nargs='*', default=[], help=(
-        "One or more numeric book ids from learning.oreilly.com URLs. "
+        "One or more book ids or full learning.oreilly.com book URLs. "
         "Optional when --books FILE is set (or CONFIG books_file exists). "
         "Example: 9780000000001 9780000000002"
     ))
@@ -3138,6 +3372,24 @@ async def amain():
     parser.add_argument('--require-auth', action='store_true', help=(
         "Exit immediately if there are no usable cookies/JWT or the auth "
         "probe fails. Skips confirmation prompts; useful for scripts/CI."
+    ))
+    parser.add_argument('--max-books', type=int, default=None, metavar='N', help=(
+        "Process at most N books this run (0 = no limit). Re-run later to continue."
+    ))
+    parser.add_argument('--pause-min', type=float, default=None, metavar='SEC', help=(
+        "Minimum random pause between books in seconds (default 0)."
+    ))
+    parser.add_argument('--pause-max', type=float, default=None, metavar='SEC', help=(
+        "Maximum random pause between books in seconds (default 0)."
+    ))
+    parser.add_argument('--no-size-check', action='store_true', help=(
+        "Disable truncated-chapter detection against API file_size."
+    ))
+    parser.add_argument('--allow-early-release', action='store_true', help=(
+        "Allow Early Release (rough cut) books marked unfinished by the API."
+    ))
+    parser.add_argument('--skip-existing', action='store_true', help=(
+        "Skip a book when the target .epub already exists (unless --force)."
     ))
     parser.add_argument('--log', metavar='PATH', default=None, help=(
         "Write a detailed debug log to PATH (created if missing). Useful for "
@@ -3348,14 +3600,17 @@ async def amain():
         jobs.extend(list(parse_books_file(args.books)))
         log.info('loaded %d book(s) from %s', len(jobs), args.books)
     for bid in list(getattr(args, 'book_ids', None) or []):
-        if not str(bid).isdigit():
+        parsed = parse_book_id(bid)
+        if not parsed:
             _die(
-                f'error: book id must be digits only, got {bid!r}\n'
+                f'error: book id must be digits or a Learning URL, got {bid!r}\n'
                 f'  Example: 9780000000001\n'
+                f'  Or: https://learning.oreilly.com/library/view/title/9780000000001/\n'
                 + report_hint()
             )
-        if not any(j[0] == bid for j in jobs):
-            jobs.append((bid, ''))
+        if not any(j[0] == parsed for j in jobs):
+            jobs.append((parsed, ''))
+
     # Legacy: some internal paths may still set book_id
     if getattr(args, 'book_id', None):
         bid = args.book_id
@@ -3409,8 +3664,35 @@ async def amain():
     # Network + API version probe (skip only if CONFIG check_connectivity False)
     await run_connectivity_checks(session_headers, assume_yes=args.yes)
 
+    if getattr(args, 'no_size_check', False):
+        CONFIG['detect_truncated'] = False
+
+    max_books = getattr(args, 'max_books', None)
+    if max_books is None:
+        max_books = int(CONFIG.get('max_books_per_run') or 0)
+    pause_min = getattr(args, 'pause_min', None)
+    if pause_min is None:
+        pause_min = float(CONFIG.get('pause_between_books_min') or 0)
+    pause_max = getattr(args, 'pause_max', None)
+    if pause_max is None:
+        pause_max = float(CONFIG.get('pause_between_books_max') or 0)
+    if pause_max < pause_min:
+        pause_min, pause_max = pause_max, pause_min
+    skip_existing = bool(
+        getattr(args, 'skip_existing', False) or CONFIG.get('skip_existing')
+    )
+    fetch_book._allow_early = bool(getattr(args, 'allow_early_release', False))
+
+    if max_books and len(jobs) > max_books:
+        print(
+            f'Note: {len(jobs)} books listed; processing first {max_books} '
+            f'this run (--max-books). Re-run later for the rest.'
+        )
+        jobs = jobs[:max_books]
+
     any_failed = False
     pdf_warn_state = {}  # print "ebook-convert missing" only once
+    jobs_done = 0
     for job_index, (book_id, book_title) in enumerate(jobs, 1):
         args.book_id = book_id
         # --title: fill empty list title from API metadata (list titles win)
@@ -3456,6 +3738,11 @@ async def amain():
             base_name = f'{book_id}{suffix}.epub'
         filename = os.path.join(out_dir, base_name)
         tmp_filename = f'{filename}.partial'
+
+        if skip_existing and not args.force and os.path.isfile(filename):
+            print(f'  skip existing {filename}')
+            jobs_done += 1
+            continue
 
         ensure_writable_dir(os.path.join(args.cache_dir, str(book_id)), 'cache')
         log.debug('preflight OK: output=%s cache=%s', filename, args.cache_dir)
@@ -3507,6 +3794,12 @@ async def amain():
             except Exception as exc:  # noqa: BLE001
                 print(f'  warning: PDF conversion error: {exc} — EPUB kept')
 
+        jobs_done += 1
+        if job_index < len(jobs) and pause_max > 0:
+            delay = random.uniform(pause_min, pause_max)
+            print(f'  pausing {delay:.0f}s before next book…')
+            await asyncio.sleep(delay)
+
     if any_failed:
         sys.exit(1)
 
@@ -3538,6 +3831,13 @@ async def _download_one_book(args, records, session_headers, filename, tmp_filen
                 if not records:
                     print('No cookies/JWT provided. Continuing without…')
                 else:
+                    try:
+                        await maybe_refresh_jwt(
+                            session, records,
+                            cookies_path=getattr(args, 'cookies', None),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f'  warning: jwt refresh skipped: {exc}')
                     rem = _jwt_remaining(records.get('orm-jwt', {}).get('value', ''))
                     jwt_definitely_expired = rem is not None and rem <= 0
                     if rem is not None:
@@ -3637,6 +3937,14 @@ async def _download_one_book(args, records, session_headers, filename, tmp_filen
                         save_cookies(args.cookies, records, session)
                         print(f'saved current cookies to {args.cookies}')
 
+        try:
+            verify_epub_package(tmp_filename)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                os.unlink(tmp_filename)
+            except OSError:
+                pass
+            raise RuntimeError(f'EPUB verification failed: {exc}') from exc
         os.replace(tmp_filename, filename)
         print(f'created {filename}')
     except (KeyboardInterrupt, asyncio.CancelledError):
